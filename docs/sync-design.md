@@ -1,0 +1,1242 @@
+# Nora Sync: Design
+
+Status: draft for review, revised after two architecture reviews. Nothing here is implemented.
+
+Base branch: `release/4.0.0-alpha.6` (upstream `Sandakan/Nora`, tip `e6b7b052`). Upstream is
+`github.com/Sandakan/Nora`; `github.com/Owie6789/Nora` is the fork and the only push target.
+
+---
+
+## 1. Problem
+
+Nora cannot move app data between machines on its own. `exportAppData.ts` and `importAppData.ts`
+give the user a manual SQL dump to a folder they pick. That is a backup primitive rather than a sync
+system: no conflict handling, no stable cross-device identity, no scheduling, no transport.
+
+The goal is bidirectional sync of user data across devices, over providers the user chooses, with an
+explicit protocol underneath instead of three provider-specific upload scripts.
+
+## 2. The constraint that shapes everything
+
+Nora has no stable cross-device identity for any entity.
+
+Every table uses `integer('id').primaryKey().generatedAlwaysAsIdentity()`. A grep across `src/` and
+`resources/` turns up zero persisted stable identifiers. `musicbrainz`, `mbid`, `fingerprint`,
+`contentHash` and `sha1` appear only in API response type declarations, never in stored data, and
+`src/types/musicbrainz_artist_data_api.d.ts` is dead, referenced by nothing.
+
+Song rows are not stable even locally. `checkFolderForUnknownContentModifications.ts:47` calls
+`removeSongsFromLibrary(...)`, and re-added files get fresh identity-generated ids, so a library
+resync invalidates any ledger keyed on `songs.id`.
+
+No name-bearing table has a unique constraint. Verified across `schema.ts`:
+
+| Table          | Natural key          | Unique? | Case-insensitive column |
+| -------------- | -------------------- | ------- | ----------------------- |
+| `artists`      | `name` varchar(1024) | no      | `name_ci`, generated    |
+| `albums`       | `title` varchar(255) | no      | `title_ci`, generated   |
+| `genres`       | `name` varchar(255)  | no      | `name_ci`, generated    |
+| `playlists`    | `name` varchar(255)  | no      | `name_ci`, generated    |
+| `musicFolders` | `path`               | yes     | none                    |
+
+Each of those `*_ci` columns is generated from the name, so it always shows the current name and can
+never record the previous one. Nora already permits two artists called "The Weeknd". Name works as a
+bootstrap heuristic and nothing more. See §6.
+
+## 3. Scope of the first shippable slice
+
+This slice is identity-independent data shipped on top of the identity foundation in §6. It is not
+"identity-free": playlists, artists, albums and genres receive `syncId`s in this same slice. The
+wording matters so a future reader does not wonder why a supposedly identity-free release already
+carries a ledger.
+
+### Syncs
+
+| Entity                            | Source                           | Notes                                                             |
+| --------------------------------- | -------------------------------- | ----------------------------------------------------------------- |
+| Preferences                       | `userSettings`                   | `language`, `theme`, `zoomFactor`, the three Last.fm send toggles |
+| Sorting states                    | `userSettings` (new JSON column) | moved out of renderer `localStorage`, see below                   |
+| Lyrics editor settings            | `userSettings` (new JSON column) | moved out of renderer `localStorage`, see below                   |
+| Keyboard shortcuts                | `userKeyboardShortcuts`          | no song references                                                |
+| Equalizer preset                  | `userEqualizerPreset`            | no song references                                                |
+| Playlist metadata                 | `playlists`                      | name only, no artwork, no membership                              |
+| Artist, album and genre favorites | `artists`, `albums`, `genres`    | `syncId`-keyed after bootstrap                                    |
+
+`recentSearches` is excluded, which the first draft of this table got wrong by including it silently. It
+is `json('recent_searches')` holding up to ten arbitrary strings typed into the search box, written
+from `search.ts` with no sanitization, so it carries whatever the user pasted. It is neither a setting
+nor device-local: it is a query history, and propagating it fills a second device's dropdown with terms
+the user never typed there. It is inside the encrypted payload so a provider cannot read it, but that
+makes it private rather than appropriate. Excluding it costs nothing a user would notice.
+
+`sortingStates` and `lyricsEditorSettings` move into `userSettings` as JSON columns in slice 1. Both
+currently live in renderer `localStorage`, which creates two problems the rest of this document cannot
+otherwise satisfy: they are unreachable from the main process, so `localStore.ts` has no legal path to
+them, and they are not transactional with PGlite, so §9's single-transaction commit cannot cover them.
+A commit that succeeded in Postgres and then failed writing renderer `localStorage` would leave a split
+state.
+
+Playlist artwork is excluded because it is not metadata. `artworks.path` is `notNull` local
+filesystem text, `source` is `LOCAL | REMOTE`, and `artworks_playlists(playlist_id, artwork_id)` is a
+composite local-integer junction. Artwork identity is a local integer plus a local file path, so
+syncing it means shipping image bytes and re-deriving row identities. That is an image replication
+system wearing a lightweight-sync label. The protocol reserves attachments (§5).
+
+### Never syncs
+
+| Excluded                                                                  | Reason                                              |
+| ------------------------------------------------------------------------- | --------------------------------------------------- |
+| `songs.path`, `folder_id`, all `musicFolders` rows                        | absolute paths mean nothing on another machine      |
+| `customLrcFilesSaveLocation`                                              | a filesystem path, same objection as `musicFolders` |
+| `playlistsSongs`, `playHistory`, `playEvents`, `seekEvents`, `skipEvents` | local integer song ids                              |
+| `ignoredDuplicateMetadata`                                                | carries `songId`                                    |
+| Song and folder blacklist                                                 | song id or folder path                              |
+| `artworks`, `artworksPlaylists`                                           | local paths and local ids                           |
+| `lastFmSessionName`, `lastFmSessionKey`                                   | credentials, not data                               |
+| `windowX/Y/Width/Height`, `windowState`                                   | device geometry                                     |
+| `recentSearches`                                                          | a query history, not a setting (§3)                 |
+| localStorage `queue`, most of `playback`                                  | reference song ids                                  |
+
+### Deferred, not rejected
+
+Song favorites, playlist membership, blacklist state, listening statistics, custom playlist artwork,
+and every Last.fm feature. All of them need song identity (§13, slices 8 and 9).
+
+## 4. Architecture
+
+```
+sync/protocol/      pure: Zod schemas, canonical serialization, versioning
+sync/merge/         pure: HLC ordering, resolution, additive sets, tombstones
+sync/providers/     transport only; knows nothing about playlists or artists
+sync/ledger/        identity: bootstrap resolution, binding, HLC, tombstones
+sync/localStore.ts  the only code that reads or writes syncable PGlite state
+sync/engine.ts      state machine and scheduler; orchestrates, issues no SQL
+```
+
+Side effects live at the edges. Merging, diffing, normalization, validation, serialization and state
+transitions are pure functions.
+
+`localStore.ts` owns reading syncable state, applying merged state, recording ledger changes, and
+write transactions. `engine.ts` sequences provider, protocol, merge and localStore. Without that
+split `engine.ts` becomes the file where every sync concern ends up, and nothing in it can be tested
+without a database.
+
+The provider boundary is bytes, and the type system enforces it:
+
+```ts
+interface SyncProvider {
+  readonly id: string;
+  readonly status: ProviderStatus; // includes 'notConfigured'
+  get(): Promise<{ blob: Uint8Array; revision: ProviderRevision }>;
+  put(blob: Uint8Array, expected: ProviderRevision | null): Promise<{ revision: ProviderRevision }>;
+}
+```
+
+The provider stores and retrieves opaque bytes. Decoding is `sync/protocol/`'s job, domain rules are
+`sync/merge/`'s job. A provider cannot see a playlist, because it cannot see anything but a byte
+array.
+
+`get` and `put` rather than a cursor-and-change-feed shape, because no provider offers a change
+stream here. See §8 for why `ProviderRevision` and the logical digest are separate things.
+
+## 5. Protocol and versioning
+
+### 5.1 Key hierarchy
+
+```
+passphrase
+  -> KDF, argon2id where available, else scrypt (§5.6)
+  -> KEK0
+  -> HKDF-SHA256(ikm=KEK0, info=canonical(kdfParams || envelopeVersion), 32)
+  -> KEK
+  -> RFC 3394 AES key unwrap, aes-kw-256
+  -> payloadKey
+  -> AES-256-GCM
+  -> canonical sync payload
+```
+
+Locally, `payloadKey` is protected by Electron `safeStorage`. Routine sync never needs the
+passphrase.
+
+There is no separate data-encryption key. V1 has one payload-encryption key and one recovery
+mechanism, and a DEK would provide no required cryptographic function. Introducing one would add a
+second wrap, a second nonce, a second tag and a second lifecycle to get wrong, in exchange for key
+separation and rotation semantics that v1 does not use. Revisit when a real requirement appears, such
+as multiple data-encryption keys or independent rotation.
+
+`safeStorage` protects `payloadKey` because it is a local credential-storage problem. The passphrase
+protects `payloadKey` because it is a cross-device recovery problem. The GitHub token authorises the
+provider and does neither. Three separate concerns, three separate secrets, never interchangeable.
+
+### 5.2 Envelope
+
+```ts
+interface SyncEnvelope {
+  envelopeVersion: 1;
+  keyWrap: {
+    kdf: { algorithm: 'argon2id' | 'scrypt'; params: KdfParams; salt: string };
+    cipher: 'aes-kw-256';
+    wrappedPayloadKey: string; // base64
+  };
+  payload: {
+    cipher: 'aes-256-gcm';
+    nonce: string; // 12 bytes, base64
+    tag: string; // 16 bytes, base64
+    ciphertext: string;
+  };
+  attachments: ManifestAttachment[]; // reserved, empty in v1
+}
+```
+
+The KDF sits under `keyWrap.kdf` and the wrapping cipher under `keyWrap.cipher`. Conflating them
+was wrong: scrypt derives a key, it does not wrap one. `algorithm` is a union because the KDF is
+feature-detected (§5.7) and a reader must know which one produced a given key rather than assume.
+
+`salt` is 16 random bytes per wrapping, base64. For argon2id it is passed as Node's `nonce` argument;
+see §5.7 for why that name matters.
+
+The payload types are discriminated on `algorithm`, so an untrusted envelope cannot pair scrypt
+parameters with Argon2id bounds or vice versa:
+
+```ts
+type KdfParams = Argon2idParams | ScryptParams;
+
+interface Argon2idParams {
+  algorithm: 'argon2id';
+  memory: number; // KiB, 8..65536
+  passes: number; // 1..10
+  parallelism: number; // 1..16
+  tagLength: 32;
+}
+
+interface ScryptParams {
+  algorithm: 'scrypt';
+  N: 16384; // 2^14, the only value Node derives without an explicit maxmem
+  r: 8;
+  p: number; // 1..16
+  keyLength: 32;
+}
+```
+
+`secret` and `associatedData` are deliberately absent. Node accepts both and both change the derived
+key while being silently ignored when misspelled (§5.7), so an envelope that carried them would be
+claiming key material the reader cannot account for. `tagLength` and `keyLength` are pinned rather than
+read from the envelope, so a remote value cannot ask for a different output length.
+`ManifestAttachment` is reserved for §5.2's attachments and is always empty in v1.
+
+### 5.3 Payload
+
+```ts
+interface SyncPayload {
+  schemaVersion: 1;
+  deviceId: string;
+  generatedAt: string; // ISO-8601 UTC, display only
+  payloadDigest: string; // SHA-256 of canonical payload with this field omitted
+  records: Record<string, SyncRecord>;
+  tombstones: Tombstone[];
+}
+```
+
+`payloadDigest` lives inside the ciphertext. An earlier draft put a keyed digest in the clear, on the
+theory that HMAC would fix the leak. It would not. An observer seeing the same digest on two devices
+still learns those devices hold identical logical state, because HMAC provides authenticity rather
+than secrecy. GCM already authenticates the plaintext, so a second MAC inside buys nothing.
+
+The cost is that Nora cannot compare logical state without fetching and decrypting first. That is
+the right trade. Decryption is local and cheap; the network fetch is the expensive part, and it
+happens anyway.
+
+Two encryptions of identical state produce different ciphertext because the nonce differs. Only the
+canonical plaintext is byte-stable.
+
+The digest is computed over the canonical payload with `payloadDigest` itself omitted, then inserted,
+then encrypted. Canonicalising a payload that still contains its own digest is circular and would
+never terminate, so the omission is part of the format definition rather than an implementation
+detail.
+
+### 5.4 Canonical serialization
+
+`canonical` is load-bearing in three security-relevant places: the digest here, the KEK `info` in §5.5,
+and the GCM additional data. If two devices serialize identical logical state differently, they
+disagree on the digest and re-push forever. So the rules are normative, not left to slice 2.
+
+Every one of these was reproduced as a real divergence:
+
+| Case                  | Measured                                                                            |
+| --------------------- | ----------------------------------------------------------------------------------- |
+| key order             | `{"a":1,"b":2}` vs `{"b":2,"a":1}`, same state, different bytes                     |
+| `undefined` vs `null` | `JSON.stringify({y:undefined})` is `{}`; `JSON.stringify({y:null})` is `{"y":null}` |
+| floating point        | `0.1 + 0.2` is `0.30000000000000004`                                                |
+| unicode normalization | `"Café"` in NFC is `436166c3a9`, in NFD is `43616665cc81`, same visible text        |
+
+Each one matters here specifically. `albums.year` is nullable and roughly a dozen `userSettings`
+columns are, so `undefined` versus `null` is reachable rather than theoretical. `zoomFactor` is
+`doublePrecision` and `frequencyBands` is a `number[]`, so float formatting is reachable. And
+`citext` does **not** normalize, so Nora stores and returns whatever bytes the tag held: a library
+with `"Café"` in NFC on one device and NFD on another fails §6.1's `name_ci` equality and mints a
+duplicate identity. That last one is a correctness bug in the identity layer, not only in the digest.
+
+The rules, so a reimplementation cannot diverge:
+
+1. Object keys sorted by UTF-16 code unit, recursively.
+2. `null` for absent values. `undefined` is a programming error and throws; it is never emitted. This
+   is the one place the codebase's own habits must be overridden, because omitting a key and setting
+   it to `null` must not produce different bytes.
+3. Numbers use ECMAScript `Number.prototype.toString`, which is shortest round-trip. `1.0` serializes as
+   `1`. Values outside the safe-integer range are rejected rather than silently rounded.
+4. Every string is Unicode NFC-normalized before escaping. Applied on read as well as on write, so
+   pre-existing NFD data in a library is normalized rather than propagating a mismatch.
+5. Timestamps are UTC ISO-8601 with milliseconds and a `Z` suffix, never the naive local strings
+   Postgres returns for `withTimezone: false` columns.
+6. Output is UTF-8 with no byte-order mark and no insignificant whitespace.
+
+Two supporting decisions follow from rule 4. Bootstrap matching compares NFC-normalized values rather
+than raw `citext` output, so normalization happens before the identity comparison rather than only
+before the digest. And §3 moves `sortingStates` and `lyricsEditorSettings` out of renderer
+`localStorage` and into `user_settings`, so that everything the digest covers is reachable from the
+main process and can participate in the §9 single transaction.
+
+This is normative now rather than deferred to slice 2, because a canonical form chosen later would
+change the digest of every payload already written. Slice 2 implements exactly these rules and adds the
+golden-vector test: one fixture payload, one expected byte string, asserted in CI, so a second
+implementation cannot disagree about what "the same logical state" means.
+
+The digest is not a security primitive. It exists to answer "do these two devices already hold the
+same logical state" after decryption.
+
+### 5.5 What is authenticated
+
+GCM authenticates only its own ciphertext. Everything in the envelope outside it is attacker-visible,
+and the envelope arrives from a provider the user chose, not from Nora.
+
+The key-wrap step happens before decryption, so the payload's GCM tag cannot protect the KDF
+parameters. And RFC 3394 AES-KW takes no associated data. Binding the parameters has to happen during
+key derivation, so that altered parameters yield a different KEK:
+
+```
+KEK = HKDF-SHA256(ikm=scrypt(...), info=canonical({kdfParams, envelopeVersion}), 32)
+```
+
+Change `params`, `salt` or `envelopeVersion` and the KEK changes, so the RFC 3394 integrity check
+value fails and the wrap is rejected. That is the binding.
+
+The payload's own GCM associated data is `canonical({envelopeVersion, schemaVersion, deviceId,
+generatedAt})`. Those fields cannot be altered without the tag failing.
+
+### 5.6 Nonces
+
+The payload nonce is 12 bytes from a CSPRNG, fresh on every encryption, and never reused under the
+same `payloadKey`. GCM nonce reuse under a repeated key leaks the XOR of plaintexts and allows
+forgery, so it is the one failure that must be structurally impossible rather than merely unlikely.
+Random 96-bit nonces put the birthday bound near 2^32 encryptions for a single key, which is far
+beyond any realistic sync count.
+
+Do not derive nonces from a counter that resets to zero on restart. Either draw randomly, or persist
+the counter alongside the HLC state.
+
+RFC 3394 AES-KW is deterministic and takes no nonce. Wrapping the same `payloadKey` under the same
+KEK yields identical bytes, which is why a passphrase change that rewraps without re-encrypting is
+safe.
+
+### 5.7 The KDF
+
+The wrapped key sits in provider storage, where anyone can attempt an offline guess. The cost factor
+is therefore the entire defence, and a per-installation random salt is what makes each guess
+independent and expensive. Not a bare `SHA-256(password)`, and not a salt-free KDF.
+
+**Argon2id is preferred, scrypt is the fallback, chosen by feature detection.**
+
+Verified directly against Node 24.21.0 on this machine:
+
+| Call                                  | Result                             |
+| ------------------------------------- | ---------------------------------- |
+| `nonce` present                       | OK                                 |
+| `salt` in place of `nonce`            | **throws `ERR_INVALID_ARG_TYPE`**  |
+| unknown key alongside a valid `nonce` | **silently ignored, no throw**     |
+| `nonce` shorter than 8 bytes          | throws `ERR_OUT_OF_RANGE`          |
+| varying `nonce`                       | changes the derived key            |
+| repeating `nonce`                     | reproduces the derived key exactly |
+
+Argon2 has no "nonce" in the specification, so Node's `nonce` is the salt slot under a misleading
+name. The two failure modes differ in severity, and conflating them is how this gets wrong.
+
+The loud one is a rename. Passing `salt` **throws**, because `nonce` is required. That is the good case,
+and it means a typo cannot silently produce a salt-free KDF. An earlier draft of this document claimed
+the opposite. Measured, an unknown key is dropped only when a _valid_ `nonce` is also present, and the
+assertion that was cited as guarding against a rename could not have detected one, because it passes
+in both the safe and the broken case. The assertion that actually detects a rename is the one asserting
+that the wrong key name **throws**, so both assertions stay.
+
+The quiet one is worse. An unknown key passed _alongside_ a valid `nonce` is ignored without
+complaint, and that is exactly how `secret` and `associatedData` behave when passed by mistake, even
+though both change the derived key. `KdfParams` therefore declares exactly the keys the implementation
+supplies, `secret` and `associatedData` are rejected rather than ignored, and the envelope records
+which KDF produced a key so a reader is never guessing.
+
+Measured on this 8 GiB-capped machine, at OWASP's recommended configurations:
+
+| KDF      | Parameters                       | Time   |
+| -------- | -------------------------------- | ------ |
+| argon2id | `m=19456` (19 MiB), `t=2`, `p=1` | 24 ms  |
+| argon2id | `m=47104` (46 MiB), `t=1`, `p=1` | 33 ms  |
+| argon2id | `m=7168` (7 MiB), `t=5`, `p=1`   | 14 ms  |
+| scrypt   | `N=2^14`, `r=8`, `p=5` (16 MiB)  | 117 ms |
+
+Argon2id is both the stronger primitive and the faster one here, so scrypt is a fallback for runtimes
+that lack it, not a considered choice.
+
+Unverified: whether Electron 44's bundled Node exposes `crypto.argon2Sync`. The Electron binary was
+never downloaded in this environment, so it could not be checked locally, and
+`releases.electronjs.org` is unreachable. Feature detection removes the need to resolve it: both
+branches are unit tested, and the KDF actually used is recorded in the envelope so a reader can tell
+which one produced a given key.
+
+There is therefore no case for shipping an Argon2 dependency. Where the native API exists it is
+already stronger and faster; where it does not, scrypt is present and adequate.
+
+### 5.8 KDF parameters are validated before derivation
+
+The envelope is untrusted input. Bounds are enforced during parse, before any expensive derivation.
+
+For scrypt:
+
+| Parameter             | Accepted range | Rationale                          |
+| --------------------- | -------------- | ---------------------------------- |
+| `N`                   | 2^14 only      | see below                          |
+| `r`                   | 8              |                                    |
+| `p`                   | 1 to 16        |                                    |
+| derived `N * r * 128` | at most 64 MiB | ceiling, checked before allocating |
+
+The `N` range is narrower than OWASP's table suggests, and the reason is Node rather than security.
+`scryptSync` defaults to `maxmem` of 32 MiB and throws `ERR_CRYPTO_INVALID_SCRYPT_PARAMS` above it.
+Measured on Node 24.21.0:
+
+| Parameters    | Derived memory | `maxmem` | Result |
+| ------------- | -------------- | -------- | ------ |
+| `N=2^14, r=8` | 16 MiB         | default  | OK     |
+| `N=2^15, r=8` | 32 MiB         | default  | throws |
+| `N=2^16, r=8` | 64 MiB         | default  | throws |
+| `N=2^16, r=8` | 64 MiB         | 128 MiB  | OK     |
+| `N=2^20, r=8` | 1024 MiB       | default  | throws |
+
+The last-but-one row is the point: `N=2^16` is not unreachable, it merely needs an explicit `maxmem`.
+Node is therefore always called with `maxmem` set from the validated ceiling, so the limit is a decision
+rather than an accident of the default, and the accepted range is `N = 2^14`, which is also OWASP's
+16 MiB configuration and the point measured in §5.7.
+
+Accepting a wider range without this would advertise values that fail at derivation time, which is the
+worst outcome for an untrusted envelope: the user sees a wrong-passphrase error for a correctly
+parameterised key.
+
+The ceiling is checked **before** allocating, and that matters for more than correctness. An attacker
+who raises `N` inside the envelope must be rejected during parse, not after a large allocation has
+already been attempted. Refusing to clamp is right for the _value_, and wrong for the _resource_: the
+bound that prevents a denial of service is enforced first, and the error is raised rather than the
+attempt being made and left to fail.
+
+For argon2id, `memory` at most 65536 KiB (64 MiB) and at least 8 KiB, `passes` 1 to 10, `parallelism`
+1 to 16, `tagLength` exactly 32.
+
+Out-of-range values cause rejection. Nora does not silently clamp, because a clamp would let a
+genuinely older Nora sync with a newer one that raised the cost without telling anyone, and it would
+turn a tampering attempt into a quiet success.
+
+The error message cannot promise to distinguish causes. A modified KDF parameter and a wrong
+passphrase both produce a failed unwrap, and neither is distinguishable before `payloadKey` is
+recovered. The message says so:
+
+> Unable to unlock sync data. The passphrase may be incorrect, or the sync envelope may have been
+> modified.
+
+Only once `payloadKey` is recovered and GCM authentication fails is there stronger evidence of
+envelope tampering. Nora does not claim to distinguish the two cases earlier than that.
+
+### 5.9 Passphrase change does not rotate the key
+
+```
+old passphrase -> old KEK -> unwrap payloadKey
+new passphrase -> new KEK -> wrap the same payloadKey
+```
+
+The payload ciphertext is untouched. Because AES-KW is deterministic, only `wrappedPayloadKey` and
+the KDF salt and parameters change in the envelope.
+
+Changing the passphrase and rotating `payloadKey` are different operations. Rotating `payloadKey`
+requires re-encrypting the payload. The UI must not conflate them.
+
+### 5.10 OS-wrapped storage is a convenience, never the only path
+
+`safeStorage` holds a local copy of `payloadKey` so routine sync never needs the passphrase. It is
+documented as unreliable in this project's macOS configuration, so the passphrase path stays
+authoritative and `safeStorage` is only ever an accelerator.
+
+Verified in this repository: macOS builds from CI are **unsigned**. `build.yml` runs
+`electron-builder --mac` with no `CSC_LINK`, no `APPLE_ID` and no `APPLE_TEAM_ID`; `electron-builder.yml`
+sets `hardenedRuntime: true` and `entitlementsInherit` but declares no signing `identity` and sets
+`notarize: false`; and no signing script exists under `scripts/` or `build/`.
+
+Electron's documentation states that on macOS an app "should be code signed for `safeStorage` to behave
+consistently", and that without a valid, consistent signature macOS may not recognise different builds
+as the same application, "which can cause the Keychain to re-prompt the user for permission on every
+update".
+
+Two consequences, both design requirements rather than warnings:
+
+- Every macOS user may be re-prompted for Keychain access on each update. The UI must present that as
+  expected behaviour rather than as a fault, and must not loop.
+- A wrapped key can become unreadable across updates. On `safeStorage` decrypt failure, or
+  `shouldReEncrypt` repeatedly failing, Nora falls back to prompting for the recovery passphrase and
+  unwraps `payloadKey` from the envelope. It never treats an OS-keychain failure as data loss, because
+  the envelope always carries a passphrase-wrapped copy.
+
+Two further platform facts apply. On Linux, `getSelectedStorageBackend()` returning `basic_text` means
+the OS provides no protection at all, since data is then "encrypted via hardcoded plaintext password";
+Nora detects that and warns rather than claiming protection it does not have. And this repository has
+no existing use of Electron's `safeStorage` at all, since the Last.fm session key goes through Nora's
+own `safeStorage.ts`, which is a different and weaker thing (§5.12). This is new ground.
+
+### 5.11 No device revocation in v1
+
+Once a second device has unwrapped `payloadKey`, changing the passphrase does not remove its ability
+to decrypt data it already holds. Revoking a provider token stops future provider access and does not
+invalidate a `payloadKey` that has already left the device.
+
+V1 has no cryptographic device revocation. This is stated so that trusted-device management, when it
+arrives, has a clear starting point: it needs real `payloadKey` rotation across devices, which v1
+deliberately does not do.
+
+### 5.12 Nora's own safeStorage.ts is not reusable here
+
+Distinct from Electron's `safeStorage`, and materially weaker. `src/main/utils/safeStorage.ts` is
+AES-256-CBC keyed by `scryptSync(MAIN_VITE_ENCRYPTION_SECRET, 'salt', 32)`, and three properties make it
+unusable for sync payloads:
+
+- the salt is the hardcoded string literal `'salt'`, so it is not per-installation
+- the key is a build-time constant shipped inside every binary, so **every Nora installation derives the
+  same key from the same input**
+- there is no MAC anywhere, and `encrypt` returns `iv || ciphertext` with no tag, so the ciphertext is
+  malleable
+
+That is obfuscation against someone reading the binary, not encryption. It exists to keep the Last.fm
+session key out of plain sight, which is a reasonable goal for a file already behind DPAPI on Windows.
+It is not a precedent for protecting sync payloads, and reusing it would mean every user's payload was
+encrypted under a key published in the release.
+
+## 6. Identity
+
+### Lifecycle
+
+```
+unbound local entity
+  -> bootstrap resolution (§6.1)
+  -> assigned syncId
+  -> syncId is authoritative during normal sync
+```
+
+Name matching exists only for initial adoption. Once an entity carries a `syncId`, that `syncId` is
+the identity and the name is payload.
+
+Any entity whose sync state must survive a cross-device rename or a change in local ids receives a
+`syncId`. In v1 that is playlists, artists, albums and genres. Adding or dropping one is a protocol
+change, which is why the rule is stated as a property rather than as a list.
+
+Why it matters, concretely. Device A has "The Weeknd" and renames it to "Abel". Device B still has
+"The Weeknd" and has never synced. If B resolves by name it either binds to the wrong identity or
+creates a second artist, and the library ends up holding both. Because none of these tables constrain
+the name and the `*_ci` column is generated, nothing in the schema prevents it.
+
+`syncId` is authoritative during normal sync and is never automatically rebound. Manual identity
+repair may explicitly break and recreate a binding, because a bad merge, a duplicated entity, a
+corrupted ledger or a restored old backup will eventually need one, and refusing to offer the escape
+hatch would make a historical mistake permanent. Repair is an explicit user action, never a side
+effect of a sync.
+
+### 6.1 Bootstrap resolution
+
+Separate from the steady-state resolver, because before a `syncId` exists the remote identity is
+unknown.
+
+The matching universe is every remote entity, not only unbound ones. A remote artist may be bound on
+device A and unbound locally on device B, and B still has to match against it.
+
+For each local entity lacking a binding:
+
+1. Collect every remote entity whose natural key matches exactly (`name_ci` or `title_ci` equality).
+   Candidates already carrying a `syncId` rank above those that do not, since a `syncId` is an
+   identity another device has already committed to.
+2. Exactly one surviving candidate binds the local entity to its `syncId`, or mints one if the
+   candidate has none. Reported as `matched` or `created`.
+3. More than one surviving candidate is ambiguous. Nora does not guess; the entity goes to the
+   unresolved queue with its candidates. Reported as `ambiguous`.
+
+Two scenarios break the naive reading of those rules, both reproduced by running them:
+
+```
+A holds two playlists both named "Workout", which the schema permits
+A bootstraps against an empty remote: mints S1 and S2, pushes both
+B holds one "Workout": two candidates match  =>  ambiguous, forever
+```
+
+A user with two legitimately same-named playlists would never converge, and would be stuck in the
+unresolved queue on every sync. The fix is to group candidates before counting them: where several
+candidates for one local entity carry `syncId`s minted by the same device in the same sync generation,
+they are one logical candidate, and the local entity binds to that group. Distinct candidates from
+_different_ devices remain a genuine ambiguity.
+
+The second is worse, because it silently duplicates:
+
+```
+A has "Workout" as S1, renames it to "Gym", pushes
+B still has "Workout", never synced, no rename history
+B: zero candidates on the name  =>  mints S9 for "Workout"
+remote now holds S1:"Gym" and S9:"Workout" -- one playlist, two identities
+```
+
+So the resolver does not mint when the local entity could be a rename of a bound remote one. Each
+record carries `renamedFrom`, the prior natural key, updated whenever a name changes. B's "Workout"
+then matches that alias and binds to S1. Where no alias exists, first contact after a rename is
+genuinely undecidable, and the honest outcome is the unresolved queue plus a question to the user, not
+a silent second mint.
+
+Both cases are why bootstrap is a distinct phase rather than a special case of steady-state
+resolution: it is the only place where a wrong guess is unrecoverable, since §6 forbids automatic
+rebinding afterwards.
+
+Trigram indexes exist on all four name columns, and fuzzy matching is not used for automatic binding.
+Artist and album names collide too easily for a false positive to be acceptable, and a wrong binding
+worse than an unresolved entry. Fuzzy matches may be suggested in the UI and never auto-applied.
+
+Mint, bind and persist happen in one transaction, but that alone is not sufficient, because the push
+sits outside it:
+
+```
+mint -> bind -> persist (transaction ENDS) -> build snapshot -> push
+crash before the push
+restart: the binding is durable, so "no candidate, therefore mint" can never run again
+=> the identity exists only on this device, is never pushed, and the device believes it is synced
+```
+
+That is silent permanent divergence: other devices never see the entity, and nothing reports it. The
+same reasoning that invalidates `songs.id` after a resync applies to a ledger row with no corresponding
+remote record, and here nothing re-mints because binding is authoritative and never automatically
+rebound (§6).
+
+The ledger therefore distinguishes two states rather than one:
+
+- `persistedAt`, when the binding became durable locally
+- `confirmedAt`, when a push carrying that binding was acknowledged
+
+On startup, any binding with `persistedAt` set and no `confirmedAt` is re-pushed before the device
+reports itself synced. Bootstrap is not considered complete until the remote acknowledges the
+identity.
+
+Every bootstrap decision is shown to the user as created, matched or ambiguous counts, with the
+ambiguous set listed. Silent auto-binding is how identity mistakes become unrecoverable.
+
+### 6.2 Songs need two identities
+
+A playlist membership has to name a song on the receiving device, and that device's `songs.id` means
+nothing to the sender. A portable song reference therefore has two parts:
+
+- the portable identity, which is sync-layer only and never a `songs.id`
+- the local binding, which is this device's `songs.id` for that portable identity, held in the ledger
+
+They are separate columns for separate reasons. Collapsing them reproduces the `songs.id` bug in a new
+place. Song identity itself, layered as MBID then ISRC then normalized metadata, is slice 8.
+
+## 7. Ordering: hybrid logical clock
+
+Wall-clock time is not the resolution authority, because a device whose clock is three days fast would
+win last-writer-wins permanently and silently.
+
+```
+hlc = { physicalMs: number, counter: number, nodeId: string }
+```
+
+**What an HLC actually guarantees, stated honestly.** It bounds _drift propagation_, not _skew bias_.
+It does not stop a fast clock from winning, because `physicalMs` is still raw wall-clock and stays the
+primary sort key. Running the rules in §7.2 verbatim:
+
+```
+A writes at real t=1000 with a clock 3 days fast  ->  259201000,0,A
+B writes at real t=2000 with a correct clock       ->       2000,0,B
+winner: A
+```
+
+The skewed device wins. And since `l` only ratchets forward (§7.3 forbids moving it backwards), that
+device keeps winning later conflicts too, even after its clock is corrected.
+
+So this design claims only what an HLC can deliver:
+
+- every device computes the **same** winner for a given set of records, because the order is total
+- a peer running far ahead cannot be trusted **silently**, because skew is detected and surfaced
+
+### 7.1 Detecting skew instead of absorbing it
+
+Each record carries the `physicalMs` its author observed. When a device sees a peer stamp beyond a
+configured drift bound, five minutes, it does not treat that stamp as authority:
+
+- the record is marked `clock_untrusted` and excluded from automatic resolution
+- the affected entities are listed in the UI, naming the device and the observed drift, so the user can
+  correct the clock or force a resolution
+- `syncId` stays authoritative regardless, because identity is never clock-ordered (§6)
+
+Without this, "the machine with the wrong clock silently owns your data" is the failure mode. With it,
+the same situation is a visible warning. Manual identity repair (§6) is the escape hatch for a binding
+a bad clock already got wrong.
+
+### 7.2 Transitions
+
+State is the last emitted `(l, c)`. `now` is the local wall clock.
+
+**Local event**
+
+```
+if now > l:
+    (physicalMs, counter) = (now, 0)
+else:
+    (physicalMs, counter) = (l, c + 1)
+```
+
+The counter branch is required. With `counter = 0` on both paths, a local write during a millisecond
+where `now <= l` produces a timestamp identical to the previous one, and two distinct changes become
+indistinguishable.
+
+**Receive event**, carrying remote `(rl, rc)`:
+
+```
+p = max(now, l, rl)
+if p == l and p == rl:  counter = max(c, rc) + 1
+if p == l and p != rl:  counter = c + 1
+if p == rl and p != l:  counter = rc + 1
+if p != l and p != rl:  counter = 0
+physicalMs = p
+```
+
+**Merge**, used when resolving a stored remote record against local state: take the greater of the
+two under the total order below, then run the receive transition on it.
+
+**Total order.** `(physicalMs, counter, nodeId)`. `nodeId` breaks remaining ties, so every device
+computes the same winner from the same set of records.
+
+### 7.3 Persistence
+
+`deviceId`, HLC state and `syncId`s are persistent. Restarting Nora must never regenerate the
+`deviceId` or move the HLC backwards.
+
+An emitted local change and the advancement of the HLC that stamped it become durable together, or
+neither becomes observable. Generating an HLC, writing the entity, crashing before the HLC persists,
+and restarting to mint the same HLC again is the failure this rules out. In practice the HLC advance
+and the entity write commit in the same ledger transaction.
+
+A bare per-device counter paired with `deviceId` is not usable. A monotonic counter alone is not
+comparable across devices: 50 on A and 3 on B say nothing about order.
+
+## 8. Concurrency: retry is not conflict
+
+A compare-and-swap failure means the remote moved. It does not mean the user has a conflict:
+
+```
+Device A pulls revision R10
+Device B pushes revision R11
+Device A attempts put with expected R10  -> 409
+```
+
+That is routine when two devices sync near-simultaneously, and treating it as a user-facing conflict
+produces spurious dialogs for something the engine can resolve:
+
+```
+put -> 409
+    -> get newest remote
+    -> decrypt, validate, resolve, merge
+    -> retry put (bounded attempts, then surface an error)
+```
+
+`remote_changed` is internal and auto-retryable. `merge_conflict` is a distinct state reached only
+when merging cannot produce a result, such as two devices renaming one entity to different values
+with no ordering that resolves it. Only that reaches the user.
+
+### 8.1 Two kinds of revision
+
+They are related but not the same, and conflating them would make every future provider a special
+case.
+
+`ProviderRevision` is the exact remote object version observed, and is provider-specific. GitHub's is
+the blob SHA. Drive has no equivalent, because Drive exposes an etag on a file it never hashes
+itself.
+
+The logical payload digest says whether the content changed. A GitHub blob SHA changes on every
+re-encryption even when nothing logical changed, because the nonce differs. The two are therefore
+stored and compared separately, and the provider contract names them differently on purpose.
+
+## 9. Atomicity
+
+A partially merged state is never visible to the user. The sequence is:
+
+```
+fetch -> authenticate and decrypt -> validate -> resolve -> build merged state
+      -> commit locally, atomically -> publish resulting state
+```
+
+Never download, apply some records, hit a conflict, crash, and leave Nora holding half of device A
+and half of device B. For a sync feature this is user-visible behaviour, not an internal detail.
+
+The local commit is one transaction. A partial apply that survives a crash is a data-loss bug.
+
+**PGlite has a single connection, so a transaction blocks the entire process.** A query issued on the
+shared instance while a transaction is open does not interleave and does not fail fast; it blocks
+until the transaction closes. Measured:
+
+```
+inside transaction: own count = 2
+concurrent pg.query on the same instance: no response after 5s
+```
+
+This is not hypothetical for Nora. `db.ts` exports one module-level instance that 26 modules import,
+and 19 call sites already open transactions, among them `parseSong.ts` during a library scan and
+`scrobble_queue.ts` during a scrobble flush.
+
+Two consequences. First, a sync commit that runs concurrently with a scan or a flush deadlocks one of
+them rather than merely interleaving. Second, `scripts/verifyPglite.ts` proving that transactions
+roll back correctly is weaker evidence than it looks, because that script is the only writer in its
+process.
+
+The sync commit therefore takes a Postgres advisory lock, and holds the database exclusively for its
+duration. The lock is verified as available by check 10 of that script. `localStore.ts` must not assume
+it can compose with other writers; it acquires the lock, and the window is kept short by chunking so
+no single transaction stays open long enough to stall a scan.
+
+## 10. Providers
+
+### 10.1 GitHub: GitHub App, flow chosen deliberately
+
+Application type is a GitHub App. GitHub's guidance leads with the recommendation, citing finer-grained
+permissions and short-lived tokens.
+
+Flow is device flow, for the initial serverless desktop implementation. The reasoning runs both ways
+and is recorded rather than presented as settled.
+
+In favour: device flow needs no client secret. GitHub states that client secrets are required to
+generate access tokens "unless your app uses the device flow", the authorization-code exchange
+documents `client_secret` as required, and refresh documents it as required unless device flow was
+used. Shipping a secret inside a distributed desktop binary defeats its own purpose.
+
+Against: GitHub also warns that device flow requires no redirect URI, so an attacker can use it to
+impersonate the app in a phishing attack, and advises against enabling it outside constrained
+environments. The GitHub App documentation separately lists desktop applications as a device-flow
+case, so the two pages genuinely disagree in emphasis.
+
+Mitigation is required in the authorization UX. The UI shows which account is being authorized and
+names the requesting app. It never implies the user can verify the request from inside Nora, because
+with device flow they cannot. The displayed user code is the phishing surface.
+
+Revisit authorization-code with PKCE if Nora gains a trusted backend able to hold a secret, or if
+users report impersonation.
+
+Device flow must be enabled in the app's settings at registration.
+
+Token lifetime, confirmed against the GitHub App documentation: user access tokens expire after 8 hours
+and refresh tokens after about 6 months. The refresh exchange needs a `client_secret` **unless the
+original token came from device flow**, which is a second, independent reason device flow is the right
+choice here. Refreshing rotates both tokens and invalidates the old refresh token, so a refresh failure
+must not leave the engine holding a stale pair. Note that GitHub App user tokens do not use OAuth
+scopes; they use fine-grained permissions, and the `scope` field is documented as always empty. There
+is no `offline_access` equivalent to request.
+
+Permissions are described honestly. Creating a repository for the authenticated user requires
+repository administration or write capability, so if Nora creates the private repo on first sync the
+initial authorization is broader than "only the sync repo", and the UI must say so. Pre-creating the
+repo allows a narrower scope afterwards. The bootstrap scope is not presented as least-privilege
+when it is not.
+
+Transport is the Contents API against a single encrypted blob with compare-and-swap on the blob SHA,
+which is the `ProviderRevision` of §8.1. One GET to fetch, one PUT to write. The Git Data API was
+rejected: it gives atomic multi-file commits, and at one blob per sync that machinery buys nothing.
+
+### 10.2 Google Drive: loopback with PKCE
+
+Device flow is unusable. Verified empirically:
+
+| Probe                                           | Result                                      |
+| ----------------------------------------------- | ------------------------------------------- |
+| `POST /device/code` with a fake client_id       | HTTP 401 `invalid_client`                   |
+| `POST /device/definitelyNotARealPath` (control) | HTTP 404                                    |
+| token exchange, device `grant_type`             | `Missing required parameter: client_secret` |
+
+The endpoint exists, since a fake client yields 401 where a bogus path yields 404, but it requires a
+`client_secret` on token exchange, which cannot ship. Drive uses RFC 8252 native app flow: loopback
+`http://127.0.0.1:<random>/callback` with PKCE `S256`.
+
+The GitHub and Drive asymmetry is a property of the two providers, not an inconsistency here.
+
+**Drive has no etag in API v3.** The v2-to-v3 mapping lists `etag` as `n/a`, so `file.etag` does not
+exist and a design must not assume it. `files.version` and `files.headRevisionId` both exist and are
+output-only; `version` is documented as monotonically increasing across every server-side change.
+Neither is documented as usable as a conditional-write precondition, so Drive offers **no documented
+compare-and-swap**.
+
+That is not a footnote, and §8's safety argument depends on it, so the gap is closed here rather than
+deferred. Without a precondition, two devices writing blind silently lose one of the two writes:
+
+```
+A and B both pull rev 10
+A writes Rock = "Metal"
+B writes Rock = "Jazz" and adds Focus
+final: { Rock: "Jazz", Focus: "Focus" }
+```
+
+A's rename is gone, no 409 ever fired, so no conflict was recorded and the user was told nothing. A then
+pulls, sees "Jazz", and adopts it. A capability flag would make the engine _know_ it is in this
+situation, but knowing is not enough on its own.
+
+So Drive ships only behind a write guard, and the choice is deliberate: **each device writes its own
+blob, under a per-device subfolder.** Device A writes `devices/A/blob`, device B writes
+`devices/B/blob`, and neither can overwrite the other. A merge pass reads every device blob and
+produces the shared snapshot through the ordinary §8 merge path. This removes the need for a
+precondition entirely, and it degrades honestly: a device that has never synced contributes no blob,
+rather than one silently winning.
+
+A single-writer lock is the rejected alternative. It would prevent silent loss, but it makes two
+devices unable to sync concurrently at all, which defeats the feature. Folder visibility, a visible
+`Nora Sync` folder against `appDataFolder`, is still undecided; it changes both the OAuth scope and the
+user's mental model, so it stays a deliberate decision.
+
+### 10.3 Last.fm: a reader, not a provider
+
+Last.fm is not a `SyncProvider`. It has no snapshot semantics and no upload, and forcing it into that
+interface would misrepresent what the API can do. It is a separate module with a typed fetch layer,
+shaped like the files in `src/main/other/lastFm/`.
+
+It also cannot ship before song identity. Nora's history tables point at local `songs.id`, and Last.fm
+returns artist and track names, so a reader that ran earlier would be unable to write into the tables
+it is meant to populate. That is why it is slice 9 rather than slice 8.
+
+Parameters for `user.getRecentTracks`, confirmed against the method documentation:
+
+| Parameter    | Value                                                               |
+| ------------ | ------------------------------------------------------------------- |
+| `limit`      | default 50, **maximum 200**                                         |
+| `from`, `to` | UNIX timestamps in integer **seconds**, UTC                         |
+| `page`       | page-based pagination; no cursor parameter is documented            |
+| `user`       | **required**, even though the method itself needs no authentication |
+| `extended`   | supported                                                           |
+
+Response paths the reader depends on:
+
+| Need                   | Path                                         |
+| ---------------------- | -------------------------------------------- |
+| now-playing marker     | `recenttracks.track[].@attr.nowplaying`      |
+| machine timestamp      | `recenttracks.track[].date.uts` (seconds)    |
+| artist / track / album | `artist["#text"]`, `.name`, `album["#text"]` |
+| MusicBrainz IDs        | `artist.mbid`, `mbid`, `album.mbid`          |
+
+Two things the reader must handle defensively, both from the documentation rather than assumption:
+
+- **All three MBID fields can be empty.** The published example has a populated artist MBID and empty
+  track and album MBIDs. They are nullable, never required to be valid.
+- **`total` in `@attr` is not guaranteed.** The official XML example shows `user`, `page`, `perPage`
+  and `totalPages` but not `total`, while JSON examples include it. The reader treats it as optional
+  and does not depend on it for pagination, using `totalPages` and stopping on a short page instead.
+- A now-playing entry may lack `date.uts`; there is an open regression on that, so a missing
+  timestamp on the now-playing row is tolerated rather than treated as malformed.
+
+No stable per-scrobble event id is documented. This is the central design consequence: the reader must
+mint its own composite listen identity, and a composite of track identity plus timestamp is not
+formally guaranteed collision-free because Last.fm documents no uniqueness constraint over those
+fields. The composite therefore includes the listening device's own local song id, so a repeat import
+of the same remote page cannot create a second row.
+
+Write-side, for duplicate avoidance: `track.scrobble` and `track.updateNowPlaying` both accept an
+optional `mbid` **alongside** required `artist` and `track`, so MBID supplements rather than replaces
+them. `track.scrobble` batches at 50 per request. `track.love` and `track.unlove` have **no** documented
+`mbid` parameter, which means love/unlove reconciliation stays keyed on artist and track names.
+
+Error handling follows the documented code list rather than a guess:
+
+- Retryable with backoff: **8** (backend failure), **11** (service offline), **16** (temporary service
+  error), **29** (rate limited).
+- Not retryable, because backoff cannot fix them: **2, 3, 5, 6, 7** (malformed request), **4, 9, 10, 13,
+  14** (credential or signature problems, recoverable only by re-authenticating), **12, 17, 18**
+  (account or subscription state), **20–25** (radio or content conditions), **26** (suspended key),
+  **27** (deprecated). Codes **1** and **19** are documented as not existing.
+
+Treating a bad session key as retryable is how a client ends up retrying invalid credentials forever,
+so that classification is explicit rather than left to a generic 5xx rule.
+
+No numeric rate limit is documented. Error 29 is the only limiter Last.fm describes, and it attributes
+throttling to the **IP address** rather than to an API key or account. The reader therefore never
+hard-codes a requests-per-second figure, treats 29 as back-off-and-retry, and paces itself
+conservatively.
+
+Unverified: `user.getLibrary` has no current method page, so nothing in this design depends on it.
+`library.gettracks` is also absent from current documentation; only `library.getArtists` is documented,
+and it needs no authentication or special approval. Whether Electron exposes Argon2id is covered in
+§5.6.
+
+### 10.4 Pluggable client IDs
+
+Both providers need only a public client ID.
+
+```
+MAIN_VITE_GITHUB_APP_CLIENT_ID
+MAIN_VITE_GOOGLE_CLIENT_ID
+```
+
+An absent client ID is a first-class state, not an error path. The provider reports `notConfigured`,
+the UI disables it with a clear message, and sync proceeds for any other provider. A build with no
+client IDs must be a working Nora, and that is tested explicitly.
+
+## 11. Sync state machine
+
+```
+idle -> connecting -> pulling -> merging -> pushing -> success
+                   \           \          \
+                    offline   conflict     error
+```
+
+`conflict` means semantic merge failure only. A CAS failure never enters it. See §8.
+
+Local changes mark state dirty and a debounced flush coalesces many mutations into one sync. Nora
+already ships an outbound queue-and-retry mechanism in `scrobble_queue.ts` and
+`sendFavoritesDataToLastFM.ts`, and the scheduler follows that shape rather than inventing a second
+one.
+
+The engine publishes through the existing `dataUpdateEvent`, which is debounced 1000ms and merged by
+dataType, so `useDataSync.tsx` invalidates React Query as it already does. No new renderer
+notification path.
+
+## 12. Verification
+
+The local gate is deliberately stricter than CI:
+
+```
+npm run format-check && npm run typecheck && npm run lint --deny-warnings && npm test
+```
+
+Measured baseline on `e6b7b052`, Node 24.21.0, npm 11.19.0:
+
+| Gate                                         | Result                                                     |
+| -------------------------------------------- | ---------------------------------------------------------- |
+| `npm run typecheck`                          | exit 0                                                     |
+| `npm test`                                   | exit 0, 14 files, 358 tests                                |
+| `npx oxfmt --check .` (whole repo)           | **exit 1**, 547 files                                      |
+| `npx oxfmt --check src test`                 | **exit 1**, 497 files                                      |
+| `npx oxlint . --deny-warnings`               | **exit 1**, 99 warning lines, 43 of them `no-explicit-any` |
+| `npm run lint --deny-warnings` (the CI form) | **exit 0**                                                 |
+
+Two numbers here needed correcting after an independent review re-measured them, and both matter
+because later slices are judged against them. The format baseline is 547 repository-wide and 497 scoped
+to `src test`, not a single figure; the scoped form is the one the per-slice budget uses, so the rule is
+"must not increase 497 or the 43". The lint baseline is 99 warning lines of which 43 are
+`no-explicit-any`; a count of 43 alone is ambiguous, so both are stated.
+
+Three findings here are repo-level, not caused by this feature, and each one weakens a gate that
+looks like it is guarding something.
+
+**Both `lint.yml` steps are dead.** `npm run lint --deny-warnings` exits 0 with 43 warnings present,
+because npm consumes `--deny-warnings` as its own config rather than forwarding it to oxlint. Adding
+the `--` separator, `npm run lint -- --deny-warnings`, exits 1. The second step runs
+`npm run format`, and `"format": "oxfmt"` writes files and always exits 0; the failing `format-check`
+script exists and is unused. Only `test` is a real gate in CI.
+
+**`format-check` cannot pass at HEAD.** `.oxfmtrc.json` sets `endOfLine: crlf`, but git stores LF,
+there is no `.gitattributes`, and `core.autocrlf` is unset, so a checkout is LF. Five of five sampled
+committed files fail. The failures are line endings only: `git diff --ignore-cr-at-eol` against the
+formatted tree is empty, while the raw diff shows every line changed. This is not a Linux artifact, it
+is the whole repository not conforming to its own configuration. Converting the tree would be a
+547-file diff unrelated to sync, so this feature does not attempt it; new files are written LF to match
+every other file in the repository, and the format gate is scoped to changed files.
+
+Two traps are worth naming, because both are easy to repeat.
+
+Formatting a new file with the repository's own config rewrites it to CRLF, which then fails the LF check
+that every other file passes. Formatting is therefore always run against a config with `endOfLine: lf`
+and with explicit file paths, never bare `.`, and never via `npm run format`, which rewrites all 547.
+
+`scripts/` is not typechecked. `tsconfig.node.json` includes `electron.vite.config.*`, `src/main/**/*`,
+`src/preload/**/*`, `src/common/*` and `src/types/*.d.ts`, and nothing else, so `npm run typecheck`
+never sees a script. `dropDatabase.ts` and `colorize-logs.ts` are in the same position. Any script
+added here is checked separately with `tsc` over that one file plus `--types node`, which is why
+`verifyPglite.ts` type-checks clean and would not have been caught otherwise.
+
+**`typecheck` is absent from CI**, which is why the local gate keeps it.
+
+Since the repository-wide format and lint gates are red before any change, "no new problems" is the
+meaningful bar rather than "all four green": the baseline above is the reference, and each slice must
+not increase 497 format failures or the 43 `no-explicit-any` warnings.
+
+### 12.1 Toolchain
+
+`package.json` declares no `engines` and no `packageManager`, but it does declare `devEngines`, which
+is the field that actually bites:
+
+```json
+"devEngines": { "packageManager": [ { "name": "npm", "version": "^11.6.2" } ] }
+```
+
+npm 10 refuses to run against this with `EBADDEVENGINES`, so `npm ci` fails before resolving a single
+dependency. Checking only `engines` and `packageManager` misses it.
+
+CI resolves `node-version: 'lts/*'`, which is currently Node 24.21.0, and that bundles npm 11.x.
+That is why CI passes and a local npm 10 does not. Any local gate has to run npm 11 or newer.
+
+Native modules add a second requirement. `postinstall` runs `electron-builder install-app-deps`, which
+rebuilds against the local Node ABI, so a local run on Node 22 exercises a different binary than CI
+builds on Node 24. Local gates therefore run under a side-by-side Node 24 at `/opt/node24` rather than
+the system Node 22, so that `test/src/main/parseSong/*` results mean what CI will see.
+
+One caveat recorded rather than hidden: the Electron rebuild cannot complete in this environment
+because `electronjs.org` is unreachable. It only targets `register-scheme`, though, and both `sharp`
+and `node-taglib-sharp` ship prebuilt binaries with no `gypfile`, so the 358-test baseline is
+unaffected. What remains unverified is `npm run build` and any real Electron runtime, neither of which
+can run here.
+
+No existing test touches the database. All 14 test files under `test/` are pure or fully mocked.
+
+**PGlite cannot run under this repo's vitest, and that constrains the design.** PGlite 0.5.8's
+emscripten loader resolves `pglite.wasm` and `pglite.data` relative to `import.meta.url`, which
+vitest's module pipeline does not preserve. Every instance fails identically with
+`TypeError: Cannot read properties of undefined (reading 'pathname')` inside `loadPackage`, before any
+query runs. Confirmed to reproduce under all seven of: the default config, `ssr.external`,
+`pool: 'forks'`, `isolate: false`, `server.deps.inline`, importing the package's ESM entry by absolute
+path, and `createRequire`.
+
+PGlite itself is healthy: it reports PostgreSQL 18.3 under plain Node. The incompatibility is with the
+test runner, not the database.
+
+**Consequence, and it is architectural.** Database-touching tests cannot live in `npm test`.
+`sync/localStore.ts` must therefore keep merging, normalisation and identity resolution in pure
+functions over explicit state, and stay a thin adapter that translates between those values and rows.
+The alternative, a sync engine whose rules are only reachable through a runner that cannot host the
+database, is worse: those rules are the part that must be exhaustively tested, and they are the part
+that can be tested without a database at all.
+
+`scripts/verifyPglite.ts` is what exists instead, and it is a real gate that exits non-zero on
+failure. Run it with `node ./scripts/verifyPglite.ts`. Against the actual `resources/drizzle/`
+migrations it asserts that PGlite starts; `citext` and `pg_trgm` register; all five migrations apply;
+the four `syncId`-bearing tables exist; citext gives case-insensitive equality; each of those four
+tables' columns round-trip identically to `schema.ts`; a failed transaction rolls back completely; a
+successful one commits every statement; duplicate playlist names are permitted; and a Postgres advisory
+lock is available.
+
+Three of those checks exist because the first version of this script was weaker than it looked, and every
+weakness was found by mutation rather than by reading it.
+
+Asserting that the four tables _exist_ is not enough. Slice 1 adds `syncId` columns through a new
+migration, and a column present in `schema.ts` but absent from every migration leaves an existence check
+perfectly green. Injecting such a column into `artists` and re-running confirmed it: all eight original
+checks still passed. Check 6 now round-trips one row per table, so the INSERT names every column drizzle
+believes exists and fails on exactly that drift.
+
+The opposite direction needed a separate check, and the first attempt claimed coverage it did not have.
+Adding `ALTER TABLE "artists" ADD COLUMN "orphan_drift_column"` to a migration left check 6 green, and
+correctly so: drizzle never selects a column it does not know about, so its own view stays internally
+consistent. Check 11 compares `information_schema.columns` against drizzle's declared SQL column names,
+which is the only place that divergence is visible.
+
+Two details of check 11 are easy to get wrong, and both were. Database column names are snake_case,
+`created_at` and `name_ci`, while drizzle's object keys are camelCase, `createdAt` and `nameCI`;
+comparing keys against database names reported every generated citext column as undeclared. And
+`getTableColumns(...)` returns a record whose `.values()` is not a method, so the first version threw
+before reporting anything.
+
+| Mutation                                                 | Result                                       |
+| -------------------------------------------------------- | -------------------------------------------- |
+| column added to `schema.ts`, absent from migrations      | check 6 fails, INSERT error names the column |
+| column added to a migration, absent from `schema.ts`     | check 11 fails, names `orphan_drift_column`  |
+| check 11's predicate replaced by a constant              | check 11 passes with the drift still present |
+| deliberate `throw` removed from the rollback transaction | check 7 fails, "Rolled back" row survives    |
+
+A rollback assertion that cannot fail is not an assertion, and that check had been green for a reason
+unrelated to rollback behaviour.
+
+One implementation note, because it produced false failures rather than false passes. The drift probes
+originally inserted inside a transaction and threw to roll back. That leaves PGlite's single connection
+in a failed state, and later statements then returned connection-level errors unrelated to the check being
+run. The probes now insert and delete by primary key, which needs no savepoints either, since PGlite
+rejects `SAVEPOINT` outside a transaction block.
+
+Two incidental facts worth keeping: drizzle records applied migrations as rows in
+`drizzle.__drizzle_migrations`, not as one table per migration, and Node's ESM resolver requires the
+explicit `.ts` extension on relative imports, which Vite does not need inside `src/`.
+
+Merge and resolution get table-driven tests over fixture pairs, covering fresh, empty, both-changed,
+corrupt, ambiguous bootstrap, duplicate-name and clock-skew cases, with no network. The HLC gets
+its own suite for normal clock, clock behind, clock ahead, several events inside one millisecond,
+receive-then-immediately-write, and concurrent writes. Providers are tested against an in-memory fake
+implementing `SyncProvider`.
+
+Crypto gets tests that the envelope rejects on: a flipped GCM tag, a flipped RFC 3394 integrity
+check value, out-of-range KDF parameters, a truncated nonce, and a digest that does not match its
+payload.
+
+## 13. Slices
+
+Each leaves the repo buildable, with no regression against the §12 baseline.
+
+0. **Done.** Dependencies installed under Node 24.21.0 and npm 11.19.0; baseline recorded in §12;
+   PGlite verified by `scripts/verifyPglite.ts`, which also settled that PGlite cannot run under
+   vitest and therefore that `localStore.ts` must stay a thin adapter over pure functions; macOS
+   signing checked and answered in §5.10.
+1. `sync_ledger` migration: bootstrap resolution, binding, HLC, tombstones, unresolved queue, with
+   `syncId`s for playlists, artists, albums and genres. Carries `persistedAt` and `confirmedAt`
+   separately (§6.1), and moves `sortingStates` and `lyricsEditorSettings` out of renderer
+   `localStorage` into `user_settings` (§3) so everything the digest covers is main-process reachable.
+   Checks 6 and 11 in `verifyPglite.ts` are extended to cover the new `syncId` columns in the same slice.
+2. Protocol types, Zod schemas, canonical serialization exactly as §5.4 specifies, envelope, digest
+   inside the ciphertext, attachments reserved. Includes the golden-vector test §5.4 calls for, so two
+   implementations cannot drift.
+3. Resolution engine: HLC ordering, retry versus conflict, additive sets, tombstones.
+4. `localStore.ts`: read syncable state, apply merged state, record ledger, atomic writes.
+5. GitHub provider: device flow, single blob, CAS on provider revision, rate-limit and offline
+   classification.
+6. Encryption: passphrase to KEK, AES-KW wrapping, GCM payload, `safeStorage` local copy including
+   `shouldReEncrypt` and the Linux `basic_text` fallback.
+7. Engine state machine, scheduler, IPC as `window.api.sync.*` alongside the 32 existing namespaces,
+   Settings UI.
+8. Song identity: portable id plus local binding, layered matching.
+9. Last.fm reader.
+10. Google Drive provider via loopback with PKCE, once a client ID exists. Ships only with the
+    per-device subfolder write guard from §10.2, since Drive v3 offers no conditional write.
+
+Push to the fork after review-worthy slices. Multi-round adversarial subagent review before every
+push.
+
+## 14. Open items
+
+Still open:
+
+- Drive folder visibility, a visible folder against `appDataFolder`.
+- Whether Electron 44's bundled Node exposes `crypto.argon2Sync`. Feature detection makes this
+  non-blocking; it only decides which branch runs first.
+- Whether Google's random loopback port needs pre-registering. Google documents both exact
+  redirect-URI matching and random loopback ports without reconciling them.
+
+Resolved, and no longer tracked because review closed them:
+
+- macOS code signing. CI macOS builds are unsigned, so §5.10 makes the passphrase path authoritative
+  and `safeStorage` an accelerator. Reopen only if signing is added.
+- Clock skew. §7 no longer claims skew immunity; skew is detected, surfaced, and excluded from
+  automatic resolution.
+- Bootstrap durability. §6.1 separates `persistedAt` from `confirmedAt` and re-pushes unconfirmed
+  bindings on startup.
+- Canonicalization. §5.4 specifies it normatively, including NFC, which also fixes a bootstrap-matching
+  bug for libraries holding NFD text.
+- The scrypt ceiling. §5.8 records Node's 32 MiB default `maxmem` and the ceiling that follows from it.
+- Argon2's `salt`-versus-`nonce` behaviour. §5.7 records the measured behaviour, and both assertions
+  are kept, including the one that can actually detect a rename.
+- Drive's missing conditional write. §10.2 gives Drive a per-device subfolder write guard instead of a
+  capability footnote.
+- The Last.fm API surface (§10.3), the GitHub token lifetime and refresh semantics (§10.1), and the
+  `offline_access` question, which does not apply to GitHub App tokens at all since they use
+  fine-grained permissions rather than scopes.
+
+## 15. Unrelated defects found while reading
+
+Reported separately, not fixed inside this feature.
+
+1. `checkForNewSongs.ts` returns inside its folder loop, so a library resync processes only the first
+   folder. This changes how much work a sync has to reconcile.
+2. `manageLastFmAuth.ts:26` performs the session-key exchange over plain `http://`. Four other files,
+   `fetchSongInfoFromLastFM.ts`, `getArtistInfoFromLastFM.ts`, `getSimilarTracks.ts` and
+   `fetchSongMetadataFromInternet.ts`, also use `http://` for Last.fm reads.
